@@ -1,0 +1,184 @@
+import argparse
+import torch
+import torch.nn as nn
+import time
+import os
+import numpy as np
+import json
+from math import pi
+
+from models.PINN import PINN
+from models.QRes import QRes
+from models.FLS import FLS
+
+from basis.fourier1d import FourierBasis1D
+from utilities.grid import Regular2DGrid
+from utilities.trainer import AdamTrainer
+from utilities.metrics import Metrics
+from utilities.plot import create_graphs_grid, create_time_evolution_gif, plot_1d_heatmap, plot_loss_track
+
+from numerical_solvers.burgers1d import burgers1d_groundtruth_generator
+
+
+def loss_function(model, training_grid, nu):
+    x = training_grid.x
+    t0 = training_grid.t0
+    u0 = -torch.sin(pi*x)
+
+    loss_ic = torch.mean((model(x,t0)-u0)**2)
+
+    t = training_grid.t
+    x_lb = training_grid.x_lb
+    x_ub = training_grid.x_ub
+
+    loss_bc = torch.mean((model(x_lb,t)-model(x_ub,t))**2)
+
+    x_res = training_grid.grid_column_x.requires_grad_()
+    t_res = training_grid.grid_column_t.requires_grad_()
+
+    u = model(x_res,t_res)
+
+    u_x = torch.autograd.grad(u, x_res, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    u_xx = torch.autograd.grad(u_x, x_res, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+    u_t = torch.autograd.grad(u, t_res, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+
+    loss_res = torch.mean((u_t + u*u_x - nu * u_xx)**2)
+
+    return (loss_ic, loss_bc, loss_res)
+
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        m.bias.data.fill_(0.0)
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser('pinn_train_module')
+    parser.add_argument('--model', type=str, default='PINN')    # options: 'PINN', 'FLS', 'QRes'
+    parser.add_argument('--dir', type=str,default='free_experiment')    # name of the directory where the results folder will be saved
+    parser.add_argument('--seed', type=int,default= 42)    # random seed
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--steps', type=int, default=5000)  
+    parser.add_argument('--lr', type=float, default=0.001)  
+    parser.add_argument('--nu',type=float,default=0.1)
+      
+    args = parser.parse_args()
+    model_name = args.model
+    dir_name = args.dir
+    device = args.device
+    seed=args.seed
+    steps = args.steps
+    lr = args.lr
+    nu = args.nu
+
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.manual_seed(seed)
+
+    save_dir = os.path.join("results", f"burgers1d", dir_name, model_name, f"seed_{seed}")
+    os.makedirs(save_dir,exist_ok=True)
+
+    # initialize model
+    if model_name == "PINN":
+        model = PINN(in_dim=2, out_dim=1)
+    elif model_name == "QRes":
+        model = QRes(in_dim=2, out_dim=1)
+    elif model_name == "FLS":
+        model = FLS(in_dim=2, out_dim=1)
+    model.apply(init_weights)
+    model = model.to(device)
+    param_count = sum([p.numel() for p in model.parameters()])
+
+
+    # domain and grid
+    domain_x = [-1.0,1.0]
+    domain_t = [0.0,1.0]
+    n_x = 201
+    n_x_basis = n_x - 1
+    n_t = 401
+    training_grid = Regular2DGrid(domain_x, domain_t, n_x,n_t)
+    training_grid = training_grid.to(device)
+
+
+    # training
+    trainer = AdamTrainer(params=list(model.parameters()),
+                    adam_lr=lr,
+                    adam_steps=steps,
+                    learning_rate_scheduler=True,
+                    loss_function=lambda: loss_function(model, training_grid, nu)
+                    )
+
+
+    start_time = time.time()
+    trainer.train()
+    end_time = time.time()
+
+    training_time = end_time - start_time
+
+    torch.save(model.state_dict(), os.path.join(save_dir, "model.pt"))
+
+    # load ground-truth solution
+    u_gt = burgers1d_groundtruth_generator(nu,n_x_basis,n_t,domain_x,domain_t)
+
+    # get predicted solution
+    basis = FourierBasis1D(n_x_basis, domain_x)
+    x = basis.x
+    t = torch.linspace(*domain_t,n_t)
+    T,X = torch.meshgrid(t,x,indexing='ij')
+    
+    t_inf = T.flatten().unsqueeze(1)
+    x_inf = X.flatten().unsqueeze(1)
+
+    model = model.to('cpu')
+    with torch.no_grad():
+        u_pred = model(x_inf,t_inf).squeeze().numpy()
+        u_pred = u_pred.reshape(n_t,n_x_basis)
+        
+
+    metrics = Metrics(u_pred,u_gt)
+    relative_l2_error_value = metrics.relative_l2_error()
+    relative_l1_error_value = metrics.relative_l1_error()
+
+    save_dir_solutions = os.path.join(save_dir, "solutions")
+    os.makedirs(save_dir_solutions,exist_ok=True)
+
+    np.save(os.path.join(save_dir_solutions, "u_pred.npy"),u_pred)
+    np.save(os.path.join(save_dir_solutions, "u_gt.npy"),u_gt)
+
+    
+    metrics_dict = {
+        "relative_l2_error": float(relative_l2_error_value),
+        "relative_l1_error": float(relative_l1_error_value),
+        "training_time": float(training_time),
+        "steps": int(steps),
+        "parameter_count": param_count
+    }
+    for key, value in metrics_dict.items():
+        print(f"{key}: {value}")
+
+    save_dir_metrics = os.path.join(save_dir, "metrics")
+    os.makedirs(save_dir_metrics,exist_ok=True)
+
+    with open(os.path.join(save_dir_metrics, "metrics.json"), "w") as f:
+        json.dump(metrics_dict, f, indent=4)
+
+    # #### PLOTS ####
+    offset = n_t // 3
+    u_plot = [u_gt[0,:], u_gt[offset,:], u_gt[2 * offset,:], u_gt[n_t-1,:]]
+    u_pred_plot = [u_pred[0,:], u_pred[offset,:], u_pred[2 * offset,:], u_pred[n_t-1,:]]
+    x_plot = basis.x.cpu().numpy()
+    t_plot = t.cpu().numpy()
+    titles = [f"t={t_plot[0].item()}", f"t={t_plot[offset].item()}", f"t={t_plot[2 * offset].item()}", f"t={t_plot[n_t-1].item()}"]
+
+    figs_dir = os.path.join(save_dir,"figures")
+    os.makedirs(figs_dir, exist_ok=True)
+
+    create_graphs_grid(x_plot,u_plot,u_pred_plot,titles,figs_dir)
+
+    create_time_evolution_gif(x_plot,t_plot,u_gt,u_pred,figs_dir)
+    
+    fig = plot_1d_heatmap(t_plot, x_plot, u_pred, figs_dir, cmap="jet")
+
+    plot_loss_track(trainer.loss_tracks, os.path.join(figs_dir, "Loss.png"))
